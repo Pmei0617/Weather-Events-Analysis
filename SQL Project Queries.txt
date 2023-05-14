@@ -1,0 +1,197 @@
+-- In this project, we will create a new database in Snowflake called 'WEATHER'
+-- We will then create a new worksheet and select that database using the 'PUBLIC' schema
+
+
+/* Create a table to store the storm data. */
+CREATE OR REPLACE TABLE severe_weather
+(
+  episode_id INTEGER,
+  event_id INTEGER,
+  state STRING,
+  state_fips_code INTEGER,
+  event_type STRING,
+  cz_type STRING,
+  cz_fips_code INTEGER,
+  cz_name STRING,
+  wfo STRING,
+  event_begin_time DATETIME,
+  event_timezone STRING,
+  event_end_time DATETIME,
+  injuries_direct INTEGER,
+  injuries_indirect INTEGER,
+  deaths_direct INTEGER,
+  deaths_indirect INTEGER,
+  damage_property INTEGER,
+  damage_crops INTEGER,
+  source STRING,
+  magnitude FLOAT,
+  magnitude_type STRING,
+  flood_cause STRING,
+  tor_f_scale STRING,
+  tor_length FLOAT,
+  tor_width INTEGER, 
+  tor_other_wfo STRING,
+  location_index INTEGER,
+  event_range FLOAT,
+  event_azimuth STRING,
+  reference_location STRING,
+  event_latitude FLOAT,
+  event_longitude FLOAT,
+  event_point GEOGRAPHY 
+);
+
+-- We will be extracting the weather data from AWS S3
+
+/* Create a staging area that points to the S3 bucket. */
+CREATE OR REPLACE STAGE severe_weather
+    url = 's3://severe-weather';
+
+
+/* List the files in the staging area (S3). */
+LIST @severe_weather;
+
+
+/* Define the format of CSV files to be loaded. */
+CREATE OR REPLACE FILE FORMAT csv_format
+  type = csv
+  field_delimiter = ','
+  record_delimiter = '\n'
+  skip_header = 1
+  null_if = ('')
+  field_optionally_enclosed_by = '\042'; 
+
+
+/* Load the storm data. */
+COPY INTO severe_weather
+  FROM @severe_weather/severe-weather
+  file_format = csv_format;
+
+-------------------------------------------------------------------------------------------------
+
+/* Create a table to store the state data. */  
+CREATE TABLE state_sizes
+(
+  state_fips_code INTEGER,
+  state_name STRING,
+  area_land_meters INTEGER,
+  area_water_meters INTEGER
+);
+
+/* List the files in the staging area (S3). */
+LIST @severe_weather;
+
+/* Load the state sizing data. */
+COPY INTO state_sizes
+  FROM @severe_weather/state_sizing.csv
+  file_format = csv_format;
+
+-------------------------------------------------------------------------------------------------
+  
+-- Now we will write queries to answer questions using the 'severe_weather' and 'state_sizes' tables found in the 'WEATHER' database
+
+-- Preview the severe weather table
+SELECT *
+FROM severe_weather
+LIMIT 10
+;
+
+-- Preview the state table
+SELECT *
+FROM state_sizes
+LIMIT 10
+;
+
+
+--Q1 What type of event, such as flooding, caused the most injuries?
+
+SELECT event_type, SUM(injuries_direct + injuries_indirect) AS total_injuries
+FROM severe_weather
+GROUP BY event_type
+ORDER BY total_injuries DESC
+;
+
+--Q2 For each month, summarize total property damage and cumulative property damage
+
+SELECT EXTRACT(MONTH, event_begin_time) AS month, SUM(damage_property) AS total_property_damage, 
+	SUM(total_property_damage) OVER (ORDER BY month) AS cumulative_property_damage
+FROM severe_weather
+GROUP BY month
+ORDER BY month ASC
+;
+
+
+--Q3 What is the property damage for each unique event and cumulative damage by storm (episode_id)?
+-- Output should display the cumulative property damage sum for each unique 'episode_id'
+
+SELECT episode_id, event_id, event_type, damage_property,
+    SUM(damage_property) OVER (PARTITION BY episode_id ORDER BY event_id ROWS UNBOUNDED PRECEDING) AS cumulative_storm_damage
+FROM severe_weather
+WHERE damage_property > 0
+ORDER BY episode_id, cumulative_storm_damage
+;
+
+--Q4 'event_id' shows storm events in chronological order. Find the property damage for each storm event and display the mean damage from the last 3 events (Including current event). 
+
+SELECT event_id, event_type, damage_property,
+	AVG(damage_property) OVER (ORDER BY event_id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS AVG_damage_last_3_event
+FROM severe_weather
+WHERE damage_property > 0
+ORDER BY event_id
+;
+
+--Q5 How many days did the longest weather event last? 
+
+SELECT event_id, event_begin_time, event_end_time, TIMESTAMPDIFF(day, event_begin_time, event_end_time) AS num_of_days
+FROM severe_weather
+ORDER BY num_of_days DESC
+;
+
+--Q6 Using CTEs, find the number of events, land area in kilometers and storms to land area ratio
+
+WITH 
+	state_sizes_km AS 
+	(SELECT state_fips_code, state_name, 
+    	ROUND((area_land_meters * 0.000001),2) AS area_land_kms, 
+        ROUND((area_water_meters * 0.000001),2) As area_water_kms
+     FROM state_sizes
+     ),
+     	storm_events_by_state AS
+     	(SELECT state_fips_code, COUNT(event_id) AS num_of_events
+     	 FROM severe_weather
+     	 GROUP BY state_fips_code
+     	 ORDER BY num_of_events DESC
+     	 ),
+         	size_and_storm_events_by_state AS
+            (SELECT ss.state_name, se.num_of_events, ss.area_land_kms,
+            	(se.num_of_events / ss.area_land_kms) AS storms_per_land_kms
+             FROM state_sizes_km ss JOIN storm_events_by_state se USING(state_fips_code)
+             ORDER BY storms_per_land_kms DESC
+             )    
+SELECT *
+FROM size_and_storm_events_by_state
+;
+
+--Q7 Categorize events with duration less than 60 minutes as 'Under an hour' and events with duration greater or equal to 60 minutes as 'At least an hour'. Display the number of storm events in these two categories.
+
+WITH event_dur_mins AS 
+	(
+    SELECT event_id, 
+       event_type, 
+       event_begin_time, 
+       event_end_time, 
+       DATEDIFF(MINUTE, event_begin_time, event_end_time) AS event_duration_mins
+	FROM severe_weather
+	ORDER BY event_duration_mins DESC
+    ),
+    event_categories AS 
+    (
+	SELECT event_id, CASE
+		WHEN event_duration_mins < 60 THEN 'Under an hour'
+    	ELSE 'At least an hour'
+    	END AS event_category
+	FROM event_dur_mins
+    )
+SELECT event_category, COUNT(*) AS count
+FROM event_categories
+GROUP BY event_category
+;
